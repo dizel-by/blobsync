@@ -1308,6 +1308,7 @@ func (b *BlobSync) cleanupBatch(ctx context.Context, batch []cleanupCandidate) e
 		if err := os.Remove(f.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("blobsync: cleanup remove %s: %w", f.Name, err)
 		}
+		b.pruneEmptyDirs(filepath.Dir(f.Path))
 	}
 	return nil
 }
@@ -1569,7 +1570,21 @@ func (b *BlobSync) removeLocalFile(rec fileRecord) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("blobsync: remove local file %s: %w", rec.Filename, err)
 	}
+	b.pruneEmptyDirs(filepath.Dir(path))
 	return nil
+}
+
+func (b *BlobSync) pruneEmptyDirs(dir string) {
+	for {
+		rel, err := filepath.Rel(b.cfg.StoragePath, dir)
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			return
+		}
+		if err := os.Remove(dir); err != nil {
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 func (b *BlobSync) aclHash() string {

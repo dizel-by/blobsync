@@ -993,7 +993,10 @@ func TestResyncOne_DeletedFile_AlreadyGone(t *testing.T) {
 
 func TestResyncOne_DeniedByACLRemovesLocalFile(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "secret.bin")
+	path := filepath.Join(dir, "private", "nested", "secret.bin")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, []byte("secret"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1009,7 +1012,7 @@ func TestResyncOne_DeniedByACLRemovesLocalFile(t *testing.T) {
 
 	rec := fileRecord{
 		ID:       10,
-		Filename: "secret.bin",
+		Filename: "private/nested/secret.bin",
 		Size:     int64(len("secret")),
 		SHA256:   sha256HexOf([]byte("secret")),
 	}
@@ -1018,6 +1021,12 @@ func TestResyncOne_DeniedByACLRemovesLocalFile(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("expected denied file to be removed")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "private")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected empty parent directories to be removed, got %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("storage root should remain: %v", err)
 	}
 }
 
@@ -1204,8 +1213,8 @@ func TestCleanup_RemovesFilesMissingOrDeletedInDB(t *testing.T) {
 	if _, err := os.Stat(orphanPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected orphan file to be removed, got %v", err)
 	}
-	if _, err := os.Stat(filepath.Dir(orphanPath)); err != nil {
-		t.Fatalf("expected cleanup to leave directories: %v", err)
+	if _, err := os.Stat(filepath.Dir(orphanPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected cleanup to remove empty directories, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)

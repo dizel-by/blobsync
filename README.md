@@ -58,7 +58,7 @@ if err := bs.AddFile(ctx, "data/example.bin"); err != nil {
 
 `Scan(ctx)` walks `StoragePath`, finds ACL-allowed local files that are missing from `bsfiles` or are marked deleted, upserts them into `bsfiles`, and creates `add` events. It does not publish NATS messages; other nodes will pick the new events up through normal reconcile.
 
-`Cleanup(ctx)` walks every local file under `StoragePath` and removes files that are missing from `bsfiles` or are marked deleted there. It leaves directories in place. Use it with caution: it is destructive and should only run when `StoragePath` is dedicated to blobsync-managed files.
+`Cleanup(ctx)` walks every local file under `StoragePath` and removes files that are missing from `bsfiles` or are marked deleted there. After file removals, blobsync prunes empty parent directories up to `StoragePath`. Use it with caution: it is destructive and should only run when `StoragePath` is dedicated to blobsync-managed files.
 
 `BindAddress` is only used for `net.Listen`, so bind-style addresses such as `:8080` are fine there. `AdvertiseAddress` is written to `bsnodes` and is used by other nodes to download files over HTTP, so it must be reachable from the rest of the cluster. `AdvertiseAddress` must not be a wildcard or loopback address such as `0.0.0.0:8080`, `[::]:8080`, `127.0.0.1:8080`, or `localhost:8080`.
 
