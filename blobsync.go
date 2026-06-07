@@ -164,6 +164,11 @@ type cleanupCandidate struct {
 	Path string
 }
 
+type natsEventMessage struct {
+	EventID  int64  `json:"event_id"`
+	Filename string `json:"filename"`
+}
+
 func New(cfg Config, opts ...Option) (*BlobSync, error) {
 	for _, opt := range opts {
 		opt(&cfg)
@@ -256,6 +261,17 @@ func (b *BlobSync) Start(ctx context.Context) error {
 
 	var cursor int64
 	if !node.Exists {
+		hasNodes, err := b.anyNodeExists(startCtx)
+		if err != nil {
+			b.markStartFailed()
+			return err
+		}
+		if !hasNodes {
+			if err := b.bootstrapStorage(startCtx); err != nil {
+				b.markStartFailed()
+				return err
+			}
+		}
 		cursor, err = b.resync(startCtx)
 		if err != nil {
 			b.markStartFailed()
@@ -305,8 +321,8 @@ func (b *BlobSync) Start(ctx context.Context) error {
 	go b.reconcileWorker()
 
 	if b.natsEnabled() {
-		sub, err := b.cfg.NATS.Subscribe(b.cfg.Subject, func(*nats.Msg) {
-			b.kickReconcile()
+		sub, err := b.cfg.NATS.Subscribe(b.cfg.Subject, func(msg *nats.Msg) {
+			b.handleNATSMessage(msg)
 		})
 		if err != nil {
 			b.cleanupFailedStart()
@@ -433,10 +449,58 @@ func (b *BlobSync) AddFile(ctx context.Context, filename string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	if err := b.publishEventContext(ctx, eventID); err != nil {
+	if err := b.publishEventContext(ctx, eventID, name); err != nil {
 		b.logf("blobsync: publish add event %d failed: %v", eventID, err)
 	}
 	b.kickReconcile()
+	return nil
+}
+
+func (b *BlobSync) Scan(ctx context.Context) error {
+	ctx, cancel := b.operationContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if _, err := os.Stat(b.cfg.StoragePath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("blobsync: stat storage: %w", err)
+	}
+
+	var added bool
+	if err := filepath.WalkDir(b.cfg.StoragePath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return fmt.Errorf("blobsync: walk storage: %w", err)
+		}
+		if path == b.cfg.StoragePath || d.IsDir() {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		name, err := filepath.Rel(b.cfg.StoragePath, path)
+		if err != nil {
+			return fmt.Errorf("blobsync: scan path: %w", err)
+		}
+		name = filepath.ToSlash(name)
+		if !b.allowedFilename(name) {
+			return nil
+		}
+		fileAdded, err := b.scanFile(ctx, name, path)
+		if err != nil {
+			return err
+		}
+		added = added || fileAdded
+		return nil
+	}); err != nil {
+		return err
+	}
+	if added {
+		b.kickReconcile()
+	}
 	return nil
 }
 
@@ -476,7 +540,7 @@ func (b *BlobSync) RemoveFile(ctx context.Context, filename string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	if err := b.publishEventContext(ctx, eventID); err != nil {
+	if err := b.publishEventContext(ctx, eventID, name); err != nil {
 		b.logf("blobsync: publish remove event %d failed: %v", eventID, err)
 	}
 	b.kickReconcile()
@@ -628,6 +692,50 @@ func (b *BlobSync) resync(ctx context.Context) (int64, error) {
 	return highWater, nil
 }
 
+func (b *BlobSync) bootstrapStorage(ctx context.Context) error {
+	if _, err := os.Stat(b.cfg.StoragePath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("blobsync: stat storage: %w", err)
+	}
+
+	return filepath.WalkDir(b.cfg.StoragePath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return fmt.Errorf("blobsync: walk storage: %w", err)
+		}
+		if path == b.cfg.StoragePath || d.IsDir() {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		name, err := filepath.Rel(b.cfg.StoragePath, path)
+		if err != nil {
+			return fmt.Errorf("blobsync: bootstrap path: %w", err)
+		}
+		name = filepath.ToSlash(name)
+		if !b.allowedFilename(name) {
+			return nil
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("blobsync: stat bootstrap file %s: %w", name, err)
+		}
+		if info.IsDir() {
+			return nil
+		}
+		sum, err := hashFileContext(ctx, path)
+		if err != nil {
+			return err
+		}
+		if err := b.upsertFileRecord(ctx, name, info.Size(), sum); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func (b *BlobSync) resyncBatch(ctx context.Context, afterID, maxID int64) ([]fileRecord, error) {
 	rows, err := b.cfg.DB.QueryContext(
 		ctx,
@@ -696,6 +804,18 @@ func (b *BlobSync) kickReconcile() {
 	case b.reconcileKick <- struct{}{}:
 	default:
 	}
+}
+
+func (b *BlobSync) handleNATSMessage(msg *nats.Msg) {
+	var event natsEventMessage
+	if err := json.Unmarshal(msg.Data, &event); err != nil || event.Filename == "" {
+		b.kickReconcile()
+		return
+	}
+	if !b.allowedFilename(event.Filename) {
+		return
+	}
+	b.kickReconcile()
 }
 
 func (b *BlobSync) applyEvents(ctx context.Context) error {
@@ -1077,6 +1197,14 @@ func (b *BlobSync) nodeRecord(ctx context.Context) (nodeRecord, error) {
 	return rec, nil
 }
 
+func (b *BlobSync) anyNodeExists(ctx context.Context) (bool, error) {
+	var count int64
+	if err := b.cfg.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM bsnodes`).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 func (b *BlobSync) insertNode(ctx context.Context, cursor int64) error {
 	_, err := b.cfg.DB.ExecContext(ctx, `INSERT INTO bsnodes SET node = ?, address = ?, lasteventid = ?, aclsha256 = ?, lastseen = NOW()`, b.cfg.Node, b.advertiseAddress, cursor, b.aclHash())
 	return err
@@ -1184,6 +1312,77 @@ func (b *BlobSync) cleanupBatch(ctx context.Context, batch []cleanupCandidate) e
 	return nil
 }
 
+func (b *BlobSync) scanFile(ctx context.Context, name, path string) (bool, error) {
+	var fileID int64
+	var dateDeleted sql.NullTime
+	err := b.cfg.DB.QueryRowContext(ctx, `SELECT id, datedeleted FROM bsfiles WHERE filename = ?`, name).Scan(&fileID, &dateDeleted)
+	if err == nil && !dateDeleted.Valid {
+		return false, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("blobsync: select scan file: %w", err)
+	}
+
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return false, fmt.Errorf("blobsync: stat scan file %s: %w", name, statErr)
+	}
+	if info.IsDir() {
+		return false, nil
+	}
+	sum, err := hashFileContext(ctx, path)
+	if err != nil {
+		return false, err
+	}
+
+	tx, err := b.cfg.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO bsfiles
+		 SET filename = ?, size = ?, sha256 = ?, dateadded = NOW(), datedeleted = NULL
+		 ON DUPLICATE KEY UPDATE size = VALUES(size), sha256 = VALUES(sha256), dateadded = NOW(), datedeleted = NULL`,
+		name, info.Size(), sum,
+	)
+	if err != nil {
+		return false, fmt.Errorf("blobsync: upsert bsfiles: %w", err)
+	}
+	if fileID == 0 {
+		fileID, err = res.LastInsertId()
+		if err != nil || fileID == 0 {
+			if err := tx.QueryRowContext(ctx, `SELECT id FROM bsfiles WHERE filename = ?`, name).Scan(&fileID); err != nil {
+				return false, fmt.Errorf("blobsync: select file id: %w", err)
+			}
+		}
+	}
+
+	if _, err := insertEvent(ctx, tx, b.cfg.Node, "add", fileID); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (b *BlobSync) upsertFileRecord(ctx context.Context, filename string, size int64, sha256 string) error {
+	_, err := b.cfg.DB.ExecContext(
+		ctx,
+		`INSERT INTO bsfiles
+		 SET filename = ?, size = ?, sha256 = ?, dateadded = NOW(), datedeleted = NULL
+		 ON DUPLICATE KEY UPDATE size = VALUES(size), sha256 = VALUES(sha256), dateadded = NOW(), datedeleted = NULL`,
+		filename, size, sha256,
+	)
+	if err != nil {
+		return fmt.Errorf("blobsync: upsert bsfiles: %w", err)
+	}
+	return nil
+}
+
 func (b *BlobSync) fileByID(ctx context.Context, fileID int64) (fileRecord, error) {
 	var rec fileRecord
 	err := b.cfg.DB.QueryRowContext(ctx, `SELECT id, filename, size, sha256, datedeleted FROM bsfiles WHERE id = ?`, fileID).
@@ -1199,14 +1398,18 @@ func insertEvent(ctx context.Context, tx *sql.Tx, node, eventType string, fileID
 	return res.LastInsertId()
 }
 
-func (b *BlobSync) publishEventContext(ctx context.Context, eventID int64) error {
+func (b *BlobSync) publishEventContext(ctx context.Context, eventID int64, filename string) error {
 	if !b.natsEnabled() {
 		return nil
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return publishNATS(b.cfg.NATS, b.cfg.Subject, []byte(strconv.FormatInt(eventID, 10)))
+	data, err := json.Marshal(natsEventMessage{EventID: eventID, Filename: filename})
+	if err != nil {
+		return err
+	}
+	return publishNATS(b.cfg.NATS, b.cfg.Subject, data)
 }
 
 func (b *BlobSync) natsEnabled() bool {

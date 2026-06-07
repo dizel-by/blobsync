@@ -48,13 +48,15 @@ if err := bs.AddFile(ctx, "data/example.bin"); err != nil {
 }
 ```
 
-`Start(ctx)`, `AddFile(ctx, filename)`, `RemoveFile(ctx, filename)`, `Resync(ctx)`, and `Cleanup(ctx)` use the caller context for cancellation and deadlines. `Start(ctx)` uses the context for startup work only; after a successful start, background workers run until `Close()`.
+`Start(ctx)`, `AddFile(ctx, filename)`, `Scan(ctx)`, `RemoveFile(ctx, filename)`, `Resync(ctx)`, and `Cleanup(ctx)` use the caller context for cancellation and deadlines. `Start(ctx)` uses the context for startup work only; after a successful start, background workers run until `Close()`.
 
 `StoragePath` defaults to `data`. Empty config values use that default, and `.` is rejected. Filenames are stored in MySQL as slash-separated paths relative to `StoragePath`. `AddFile` accepts either a relative path such as `data/example.bin` or an absolute path under `StoragePath`. Downloaded files are written under `StoragePath`, and files outside that directory are rejected.
 
 `HTTPPrefix` changes the built-in HTTP download route. With `HTTPPrefix: "/blobsync"`, files are served as `http://node-address/blobsync/123`. All nodes in the cluster should use the same prefix.
 
 `WithACL(acl)` sets filename prefixes before start. ACL cannot be changed on a running `BlobSync`; create a new instance with a different `WithACL` value and restart it. If whitelist is non-empty, only matching files are synchronized. If blacklist is non-empty, matching files are not synchronized. Blacklist wins over whitelist. The normalized ACL fingerprint is stored in `bsnodes.aclsha256`. Changing ACL in config and restarting the process runs a full `Resync`, so files that are no longer allowed are removed locally and newly allowed files are downloaded.
+
+`Scan(ctx)` walks `StoragePath`, finds ACL-allowed local files that are missing from `bsfiles` or are marked deleted, upserts them into `bsfiles`, and creates `add` events. It does not publish NATS messages; other nodes will pick the new events up through normal reconcile.
 
 `Cleanup(ctx)` walks every local file under `StoragePath` and removes files that are missing from `bsfiles` or are marked deleted there. It leaves directories in place. Use it with caution: it is destructive and should only run when `StoragePath` is dedicated to blobsync-managed files.
 

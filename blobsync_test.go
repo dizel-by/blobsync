@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -289,6 +290,60 @@ func TestStart_ExistingNodeSameACLSkipsResync(t *testing.T) {
 	mock.ExpectExec(`UPDATE bsnodes SET address = \?, aclsha256 = \?, lastseen = NOW\(\) WHERE node = \?`).
 		WithArgs("10.0.0.1:8080", bs.aclHash(), "testnode").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := bs.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestStart_FirstNodeBootstrapsStorageWithoutEvents(t *testing.T) {
+	dir := t.TempDir()
+	publicPath := filepath.Join(dir, "public", "file.bin")
+	privatePath := filepath.Join(dir, "private.bin")
+	content := []byte("bootstrap")
+	if err := os.MkdirAll(filepath.Dir(publicPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(publicPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(privatePath, []byte("private"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, mock := newMockDB(t)
+	cfg := validConfig(db)
+	cfg.Node = "testnode"
+	cfg.BindAddress = "127.0.0.1:0"
+	cfg.StoragePath = dir
+	bs, err := New(cfg, WithACL(ACL{Whitelist: []string{"public/"}}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer bs.Close()
+
+	mock.ExpectQuery(`SELECT lasteventid, aclsha256 FROM bsnodes WHERE node = ?`).
+		WithArgs("testnode").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM bsnodes`).
+		WillReturnRows(sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(int64(0)))
+	mock.ExpectExec(`INSERT INTO bsfiles`).
+		WithArgs("public/file.bin", int64(len(content)), sha256HexOf(content)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(`SELECT MAX\(id\) FROM bsevents`).
+		WillReturnRows(sqlmock.NewRows([]string{"MAX(id)"}).AddRow(nil))
+	mock.ExpectQuery(`SELECT MAX\(id\) FROM bsfiles`).
+		WillReturnRows(sqlmock.NewRows([]string{"MAX(id)"}).AddRow(int64(1)))
+	mock.ExpectQuery(`SELECT id, filename, size, sha256, datedeleted FROM bsfiles`).
+		WithArgs(int64(0), int64(1), DefaultResyncBatch).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "filename", "size", "sha256", "datedeleted"}).
+			AddRow(int64(1), "public/file.bin", int64(len(content)), sha256HexOf(content), nil))
+	mock.ExpectExec(`INSERT INTO bsnodes SET node = \?, address = \?, lasteventid = \?, aclsha256 = \?, lastseen = NOW\(\)`).
+		WithArgs("testnode", "10.0.0.1:8080", int64(0), bs.aclHash()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := bs.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -1004,6 +1059,106 @@ func TestLocalPath_RejectsAbsoluteFilenameFromDB(t *testing.T) {
 	}
 }
 
+func TestScan_AddsNewAllowedFilesWithoutNATS(t *testing.T) {
+	dir := t.TempDir()
+	existingPath := filepath.Join(dir, "allowed", "existing.bin")
+	newPath := filepath.Join(dir, "allowed", "new.bin")
+	deniedPath := filepath.Join(dir, "denied.bin")
+	newContent := []byte("new file")
+	if err := os.MkdirAll(filepath.Dir(existingPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(existingPath, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPath, newContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(deniedPath, []byte("denied"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, mock := newMockDB(t)
+	cfg := validConfig(db)
+	cfg.StoragePath = dir
+	cfg.NATS = &nats.Conn{}
+	cfg.Subject = "events"
+	bs, err := New(cfg, WithACL(ACL{Whitelist: []string{"allowed/"}}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	oldPublish := publishNATS
+	publishNATS = func(conn *nats.Conn, subject string, data []byte) error {
+		t.Fatal("Scan must not publish to NATS")
+		return nil
+	}
+	t.Cleanup(func() { publishNATS = oldPublish })
+
+	mock.ExpectQuery(`SELECT id, datedeleted FROM bsfiles WHERE filename = \?`).
+		WithArgs("allowed/existing.bin").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "datedeleted"}).AddRow(int64(10), nil))
+	mock.ExpectQuery(`SELECT id, datedeleted FROM bsfiles WHERE filename = \?`).
+		WithArgs("allowed/new.bin").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectBegin()
+	mock.ExpectExec(`INSERT INTO bsfiles`).
+		WithArgs("allowed/new.bin", int64(len(newContent)), sha256HexOf(newContent)).
+		WillReturnResult(sqlmock.NewResult(11, 1))
+	mock.ExpectExec(`INSERT INTO bsevents`).
+		WithArgs("node1", "add", int64(11)).
+		WillReturnResult(sqlmock.NewResult(100, 1))
+	mock.ExpectCommit()
+
+	if err := bs.Scan(context.Background()); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	select {
+	case <-bs.reconcileKick:
+	default:
+		t.Fatal("Scan should kick reconcile after creating events")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestScan_ReaddsDeletedFileWithEvent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "deleted.bin")
+	content := []byte("restored")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, mock := newMockDB(t)
+	cfg := validConfig(db)
+	cfg.StoragePath = dir
+	bs, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	mock.ExpectQuery(`SELECT id, datedeleted FROM bsfiles WHERE filename = \?`).
+		WithArgs("deleted.bin").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "datedeleted"}).AddRow(int64(7), time.Now()))
+	mock.ExpectBegin()
+	mock.ExpectExec(`INSERT INTO bsfiles`).
+		WithArgs("deleted.bin", int64(len(content)), sha256HexOf(content)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO bsevents`).
+		WithArgs("node1", "add", int64(7)).
+		WillReturnResult(sqlmock.NewResult(101, 1))
+	mock.ExpectCommit()
+
+	if err := bs.Scan(context.Background()); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 func TestCleanup_RemovesFilesMissingOrDeletedInDB(t *testing.T) {
 	dir := t.TempDir()
 	keepPath := filepath.Join(dir, "keep.bin")
@@ -1110,8 +1265,12 @@ func TestAddFile_PublishErrorAfterCommitIsLoggedOnly(t *testing.T) {
 		if subject != "events" {
 			t.Fatalf("subject = %q, want events", subject)
 		}
-		if string(data) != "99" {
-			t.Fatalf("event id payload = %q, want 99", string(data))
+		var msg natsEventMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			t.Fatalf("unmarshal nats payload: %v", err)
+		}
+		if msg.EventID != 99 || msg.Filename != "file.bin" {
+			t.Fatalf("nats payload = %+v, want event 99 file.bin", msg)
 		}
 		return errors.New("nats down")
 	}
@@ -1156,8 +1315,12 @@ func TestRemoveFile_PublishErrorAfterCommitIsLoggedOnly(t *testing.T) {
 		if subject != "events" {
 			t.Fatalf("subject = %q, want events", subject)
 		}
-		if string(data) != "77" {
-			t.Fatalf("event id payload = %q, want 77", string(data))
+		var msg natsEventMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			t.Fatalf("unmarshal nats payload: %v", err)
+		}
+		if msg.EventID != 77 || msg.Filename != "file.bin" {
+			t.Fatalf("nats payload = %+v, want event 77 file.bin", msg)
 		}
 		return errors.New("nats down")
 	}
@@ -1183,6 +1346,52 @@ func TestRemoveFile_PublishErrorAfterCommitIsLoggedOnly(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestHandleNATSMessage_SkipsDeniedFilename(t *testing.T) {
+	db, _ := newMockDB(t)
+	bs, err := New(validConfig(db), WithACL(ACL{Whitelist: []string{"public/"}}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	data, err := json.Marshal(natsEventMessage{EventID: 1, Filename: "private/file.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs.handleNATSMessage(&nats.Msg{Data: data})
+
+	select {
+	case <-bs.reconcileKick:
+		t.Fatal("denied filename should not kick reconcile")
+	default:
+	}
+}
+
+func TestHandleNATSMessage_KicksAllowedOrLegacyMessage(t *testing.T) {
+	db, _ := newMockDB(t)
+	bs, err := New(validConfig(db), WithACL(ACL{Whitelist: []string{"public/"}}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	data, err := json.Marshal(natsEventMessage{EventID: 1, Filename: "public/file.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs.handleNATSMessage(&nats.Msg{Data: data})
+	select {
+	case <-bs.reconcileKick:
+	default:
+		t.Fatal("allowed filename should kick reconcile")
+	}
+
+	bs.handleNATSMessage(&nats.Msg{Data: []byte("1")})
+	select {
+	case <-bs.reconcileKick:
+	default:
+		t.Fatal("legacy message should kick reconcile")
 	}
 }
 
