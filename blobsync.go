@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -1580,7 +1581,7 @@ func (b *BlobSync) pruneEmptyDirs(dir string) {
 		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 			return
 		}
-		if err := os.Remove(dir); err != nil {
+		if err := syscall.Rmdir(dir); err != nil {
 			return
 		}
 		dir = filepath.Dir(dir)
