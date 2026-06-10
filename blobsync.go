@@ -268,10 +268,13 @@ func (b *BlobSync) Start(ctx context.Context) error {
 			return err
 		}
 		if !hasNodes {
+			b.logf("blobsync: first node, scanning local storage")
 			if err := b.bootstrapStorage(startCtx); err != nil {
 				b.markStartFailed()
 				return err
 			}
+		} else {
+			b.logf("blobsync: new node, syncing from peers")
 		}
 		cursor, err = b.resync(startCtx)
 		if err != nil {
@@ -299,11 +302,13 @@ func (b *BlobSync) Start(ctx context.Context) error {
 	}
 
 	if !node.Exists {
+		b.logf("blobsync: registering node %s", b.cfg.Node)
 		if err := b.insertNode(startCtx, cursor); err != nil {
 			b.cleanupFailedStart()
 			return err
 		}
 	} else if !node.ACLHash.Valid || node.ACLHash.String != b.aclHash() {
+		b.logf("blobsync: ACL changed, resyncing")
 		cursor, err = b.resync(startCtx)
 		if err != nil {
 			b.cleanupFailedStart()
@@ -733,6 +738,7 @@ func (b *BlobSync) bootstrapStorage(ctx context.Context) error {
 		if err := b.upsertFileRecord(ctx, name, info.Size(), sum); err != nil {
 			return err
 		}
+		b.logf("blobsync: bootstrap: registered %s", name)
 		return nil
 	})
 }
