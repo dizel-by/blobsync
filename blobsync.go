@@ -1018,6 +1018,7 @@ func (b *BlobSync) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	b.logf("blobsync: serving %s to %s", rec.Filename, r.RemoteAddr)
 	http.ServeFile(w, r, path)
 }
 
@@ -1143,6 +1144,7 @@ func (b *BlobSync) downloadFrom(ctx context.Context, node nodeAddress, rec fileR
 		_ = os.Remove(tmp)
 		return fmt.Errorf("blobsync: replace file: %w", err)
 	}
+	b.logf("blobsync: downloaded %s from %s", rec.Filename, node.Node)
 	return nil
 }
 
